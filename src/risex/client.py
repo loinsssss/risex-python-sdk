@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Sequence
-from typing import Any, Self, TypeVar
+from typing import Any, Self, TypeVar, get_args
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -25,11 +27,14 @@ from .exceptions import (
 )
 from .models import (
     AccountSnapshot,
+    AccountUpdate,
     Balance,
     Balances,
     Cancellation,
     Channel,
+    DecodedTransaction,
     Fill,
+    LoginSession,
     Market,
     MarketsResponse,
     NonceState,
@@ -42,6 +47,8 @@ from .models import (
     OrderResponse,
     OrderStatus,
     OrderSubmission,
+    OrderType,
+    PortfolioDetails,
     Position,
     PositionResponse,
     PositionsResponse,
@@ -49,16 +56,24 @@ from .models import (
     SessionKeyStatus,
     SignerRegistration,
     SigningDomain,
+    StopType,
     SubmissionResolution,
     SystemConfig,
     TimeInForce,
+    TpslCancellation,
+    TpslOrder,
+    TpslOrdersResponse,
+    TpslStatus,
     TradeHistory,
+    UserFees,
 )
 from .nonce import Nonce, NonceManager
 from .rate_limit import RateLimiter
 from .rest import RestClient
+from .session import JwtSession
 from .signing import (
     Signer,
+    account_setting_action_hash,
     address,
     cancel_action_hash,
     cancel_all_action_hash,
@@ -136,6 +151,7 @@ class RiseXClient:
         if signer is not None:
             address(signer.address)
         self._rest = RestClient(config, transport=transport)
+        self._jwt = JwtSession(self._rest)
         self._streams: set[RiseXStream] = set()
         self._closed = False
         self._metadata: ProtocolMetadata | None = None
@@ -178,6 +194,7 @@ class RiseXClient:
         if self._closed:
             return
         self._closed = True
+        self._jwt.close()
         try:
             results = await asyncio.gather(
                 *(stream.aclose() for stream in tuple(self._streams)), return_exceptions=True
@@ -220,6 +237,53 @@ class RiseXClient:
     async def get_system_config(self) -> SystemConfig:
         self._ensure_open()
         return _parse(SystemConfig, await self._rest.get("/v1/system/config"))
+
+    async def decode_transaction(self, tx_hash: str) -> DecodedTransaction:
+        """Read a transaction outcome and any provider-decoded contract revert details."""
+        self._ensure_open()
+        if not isinstance(tx_hash, str) or re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash) is None:
+            raise ValueError("tx_hash must be 0x followed by 64 hexadecimal characters")
+        payload = await self._rest.get(f"/v1/tx/{tx_hash}", error_is_data=True)
+        result = _parse(DecodedTransaction, payload)
+        if result.tx_hash is not None and result.tx_hash.lower() != tx_hash.lower():
+            raise ProtocolError("Decoded transaction response belongs to another transaction")
+        return result
+
+    @property
+    def session(self) -> LoginSession | None:
+        """Session metadata only; closing the client discards tokens without network I/O."""
+        return self._jwt.info
+
+    async def login(self) -> LoginSession:
+        """Sign Login with the configured owner or registered session key. No allowance changes."""
+        self._ensure_open()
+        account, signer = self._credentials()
+        if address(signer.address) != account and not (await self.get_signer_status()).active:
+            raise AuthenticationError("JWT login requires an active registered session key")
+        return await self._jwt.login(account, signer, self.initialize)
+
+    async def refresh_session(self) -> LoginSession:
+        self._ensure_open()
+        return await self._jwt.refresh()
+
+    async def logout(self) -> bool:
+        """Revoke this token family once; always discard its local tokens, including on failure."""
+        self._ensure_open()
+        return await self._jwt.logout()
+
+    async def get_user_fees(self) -> UserFees:
+        """Read the logged-in account's fees; automatically refresh an expiring session."""
+        self._ensure_open()
+        token = await self._jwt.access_token()
+        try:
+            payload = await self._rest.get(
+                "/v1/user/fees", bearer_token=token, exact_json_numbers=True
+            )
+        except APIError as error:
+            if error.status_code == 401:
+                self._jwt.invalidate(token)
+            raise
+        return _parse(UserFees, payload)
 
     async def initialize(self, *, force_refresh: bool = False) -> ProtocolMetadata:
         """Fetch and cross-check signing domain and router; no signing or mutations."""
@@ -412,6 +476,100 @@ class RiseXClient:
             raise ProtocolError("Position response belongs to another market")
         return result
 
+    async def get_portfolio_details(self, *, account: str | None = None) -> PortfolioDetails:
+        self._ensure_open()
+        selected = self._account_address(account)
+        result = _parse(
+            PortfolioDetails,
+            await self._rest.get("/v1/portfolio/details", params=[("account", selected)]),
+        )
+        if result.account != selected:
+            raise ProtocolError("Portfolio response belongs to another account")
+        ids = [p.market_id for p in result.positions]
+        if len(ids) != len(set(ids)) or any(i <= 0 for i in ids):
+            raise ProtocolError("Portfolio contains duplicate or invalid market IDs")
+        return result
+
+    async def update_leverage(self, market_id: int, leverage: int) -> AccountUpdate:
+        """Single signed mutation; an unknown outcome must be reconciled, not replayed."""
+        self._ensure_open()
+        action_hash = account_setting_action_hash(market_id, leverage, setting="leverage")
+        markets = await self.get_markets(market_ids=[market_id], force_refresh=True)
+        market = next((m for m in markets.markets if m.market_id == market_id), None)
+        if market is None or market.config.max_leverage is None:
+            raise ProtocolError("Cannot verify market leverage limit")
+        if leverage > market.config.max_leverage:
+            raise ValueError("Leverage exceeds the market maximum")
+        return await self._update_account_setting(
+            market_id,
+            "/v1/account/leverage",
+            "update_leverage",
+            {"leverage": str(leverage)},
+            action_hash,
+        )
+
+    async def update_margin_mode(self, market_id: int, *, isolated: bool) -> AccountUpdate:
+        self._ensure_open()
+        if type(isolated) is not bool:
+            raise TypeError("isolated must be bool")
+        value = int(isolated)
+        return await self._update_account_setting(
+            market_id,
+            "/v1/account/margin-mode",
+            "update_margin_mode",
+            {"margin_mode": value},
+            account_setting_action_hash(market_id, value, setting="margin_mode"),
+        )
+
+    async def _update_account_setting(
+        self, market_id: int, path: str, operation: str, fields: dict[str, Any], action_hash: bytes
+    ) -> AccountUpdate:
+        account, _ = self._credentials()
+        await self.initialize()
+        async with self._nonces.operation_lock:
+            nonce = await self._nonces.reserve()
+            permit = await self._permit(action_hash, nonce)
+            return await self._submit(
+                path,
+                {"market_id": str(market_id), **fields, "permit_params": permit},
+                MutationContext(
+                    operation, account, nonce.anchor, nonce.bitmap_index, market_id=market_id
+                ),
+                AccountUpdate,
+            )
+
+    async def cancel_all_tpsl_orders(self, market_id: int) -> TpslCancellation:
+        """Cancel accepted TP/SLs only; triggered orders still require reconciliation."""
+        self._ensure_open()
+        validate_market_id(market_id)
+        account, signer = self._credentials()
+        metadata = await self.initialize()
+        deadline = int(time.time()) + self.config.permit_ttl_seconds
+        signature = await auth.sign(
+            signer,
+            typed_data(
+                metadata.domain.signing_values(),
+                "CancelAllTpslOrders",
+                {
+                    "account": account,
+                    "marketId": market_id,
+                    "deadline": deadline,
+                },
+            ),
+        )
+        return await self._submit(
+            "/v1/orders/tpsl/cancel-all",
+            {
+                "account": account,
+                "market_id": str(market_id),
+                "signer": address(signer.address),
+                "deadline": deadline,
+                "signature": base64.b64encode(signature).decode("ascii"),
+            },
+            MutationContext("cancel_all_tpsl_orders", account, None, None, market_id=market_id),
+            TpslCancellation,
+        )
+
     async def get_positions(
         self,
         *,
@@ -521,6 +679,93 @@ class RiseXClient:
         if market_id is not None and response.order.market_id != market_id:
             raise ProtocolError("Order lookup returned a different market")
         return response.order
+
+    async def get_tpsl_orders(
+        self,
+        *,
+        account: str | None = None,
+        market_id: int | None = None,
+        page: int = 1,
+        limit: int = 100,
+        statuses: Sequence[TpslStatus] = (),
+        stop_type: StopType = "STOP_TYPE_NONE",
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> TpslOrdersResponse:
+        """Read TP/SLs; explicitly send STOP_TYPE_NONE to include both stop types."""
+        self._ensure_open()
+        _page(page, limit)
+        selected = self._account_address(account)
+        if stop_type not in get_args(StopType):
+            raise ValueError("Unknown stop type")
+        if isinstance(statuses, str) or any(s not in get_args(TpslStatus) for s in statuses):
+            raise ValueError("Unknown TP/SL status filter")
+        if len(set(statuses)) != len(statuses):
+            raise ValueError("Duplicate TP/SL statuses")
+        params = [
+            ("account", selected),
+            ("page", str(page)),
+            ("limit", str(limit)),
+            ("stop_type", stop_type),
+        ]
+        self._history_filters(params, market_id, start_time, end_time)
+        params.extend(("statuses", s) for s in statuses)
+        result = _parse(TpslOrdersResponse, await self._rest.get("/v1/orders/tpsl", params=params))
+        expected = min(limit, max(0, result.total - (page - 1) * limit))
+        if result.page != page or result.limit != limit or len(result.orders) != expected:
+            raise ProtocolError("TP/SL pagination is inconsistent; results may be incomplete")
+        if len({o.order_id for o in result.orders}) != len(result.orders):
+            raise ProtocolError("TP/SL response contains duplicate order IDs")
+        for order in result.orders:
+            if order.account != selected:
+                raise ProtocolError("TP/SL response belongs to another account")
+            if market_id is not None and order.market_id != market_id:
+                raise ProtocolError("TP/SL response belongs to another market")
+            if statuses and order.status not in statuses:
+                raise ProtocolError("TP/SL response ignored status filters")
+            if stop_type != "STOP_TYPE_NONE" and order.stop_type != stop_type:
+                raise ProtocolError("TP/SL response ignored stop type filter")
+        return result
+
+    async def iter_tpsl_orders(
+        self,
+        *,
+        account: str | None = None,
+        market_id: int | None = None,
+        page_size: int = 100,
+        max_pages: int = 1000,
+        statuses: Sequence[TpslStatus] = (),
+        stop_type: StopType = "STOP_TYPE_NONE",
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> AsyncIterator[TpslOrder]:
+        _max_pages(max_pages)
+        seen: set[str] = set()
+        total: int | None = None
+        for page in range(1, max_pages + 1):
+            result = await self.get_tpsl_orders(
+                account=account,
+                market_id=market_id,
+                page=page,
+                limit=page_size,
+                statuses=statuses,
+                stop_type=stop_type,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if total is not None and result.total != total:
+                raise ProtocolError("TP/SL total changed during pagination; refresh the snapshot")
+            total = result.total
+            for order in result.orders:
+                if order.order_id in seen:
+                    raise ProtocolError(
+                        "TP/SL pagination repeated an order; results may be incomplete"
+                    )
+                seen.add(order.order_id)
+                yield order
+            if not result.has_next_page:
+                return
+        raise ProtocolError("TP/SL pagination exceeded max_pages; results may be incomplete")
 
     async def get_order_history(
         self,
@@ -691,7 +936,11 @@ class RiseXClient:
         ):
             raise ValueError("Requested market only permits reduce-only resting orders")
         size_steps = market.config.quantity_to_steps(request.quantity)
-        price_ticks = market.config.price_to_ticks(request.price)
+        price_ticks = (
+            0
+            if request.order_type == OrderType.MARKET
+            else market.config.price_to_ticks(request.price)
+        )
         packed = pack_order(
             market_id=request.market_id,
             size_steps=size_steps,
@@ -844,14 +1093,16 @@ class RiseXClient:
         selected = self._account_address()
         if address(context.account) != selected:
             raise ValueError("Submission belongs to a different account")
-        state = await self.get_nonce_state()
-        consumed = (
-            bool((state.bitmap >> context.nonce_bitmap_index) & 1)
-            if state.nonce_anchor == context.nonce_anchor
-            else False
-            if state.nonce_anchor < context.nonce_anchor
-            else None
-        )
+        consumed = None
+        if context.nonce_anchor is not None and context.nonce_bitmap_index is not None:
+            state = await self.get_nonce_state()
+            consumed = (
+                bool((state.bitmap >> context.nonce_bitmap_index) & 1)
+                if state.nonce_anchor == context.nonce_anchor
+                else False
+                if state.nonce_anchor < context.nonce_anchor
+                else None
+            )
         found: list[Order] = []
         if context.operation == "place_order" and context.client_order_id:
             async for order in self.iter_order_history(
@@ -874,10 +1125,16 @@ class RiseXClient:
         return SubmissionResolution(orders=tuple(found), nonce_consumed=consumed, resolved=resolved)
 
     async def get_account_snapshot(
-        self, *, account: str | None = None, max_pages: int = 1000
+        self,
+        *,
+        account: str | None = None,
+        max_pages: int = 1000,
+        include_conditional_orders: bool = False,
     ) -> AccountSnapshot:
         """Fresh REST views for recovery; separate calls are not an atomic exchange snapshot."""
         selected = self._account_address(account)
+        if type(include_conditional_orders) is not bool:
+            raise TypeError("include_conditional_orders must be bool")
 
         async def positions() -> tuple[Position, ...]:
             return tuple(
@@ -889,10 +1146,29 @@ class RiseXClient:
                 [row async for row in self.iter_open_orders(account=selected, max_pages=max_pages)]
             )
 
-        balances, (position_rows, order_rows) = await _pair(
-            self.get_balances(account=selected), _pair(positions(), orders())
+        async def conditionals() -> tuple[TpslOrder, ...] | None:
+            if not include_conditional_orders:
+                return None
+            return tuple(
+                [
+                    row
+                    async for row in self.iter_tpsl_orders(
+                        account=selected,
+                        max_pages=max_pages,
+                        statuses=("TPSL_ORDER_STATUS_ACCEPTED", "TPSL_ORDER_STATUS_TRIGGERED"),
+                    )
+                ]
+            )
+
+        (balances, conditional_rows), (position_rows, order_rows) = await _pair(
+            _pair(self.get_balances(account=selected), conditionals()), _pair(positions(), orders())
         )
-        return AccountSnapshot(balances=balances, positions=position_rows, open_orders=order_rows)
+        return AccountSnapshot(
+            balances=balances,
+            positions=position_rows,
+            open_orders=order_rows,
+            conditional_orders=conditional_rows,
+        )
 
     async def _websocket_auth(self) -> dict[str, Any]:
         account, signer = self._credentials()

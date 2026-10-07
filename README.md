@@ -26,16 +26,17 @@ upstream exchange routes used by the SDK.
 Implemented: public market data; account balances, positions and history;
 delegated signer registration/revocation; EIP-712 order permits; limit/market
 orders, cancellation and outcome reconciliation; public and private streams;
-and a checksummed local orderbook.
+and a checksummed local orderbook. This development branch adds JWT sessions,
+account fee-tier reads, and paginated TP/SL enumeration.
 
-This is an alpha release (`0.1.0a2`). Offline lifecycle tests and live public
+This checkout is `0.1.0a3.dev0`; the published alpha is `0.1.0a2`. Offline lifecycle tests and live public
 checks pass, as do live testnet account reads and authenticated order/position
 snapshots. Funded transactions, live fills and private reconnect/expiry scenarios
 remain to be validated, with explicit test gates provided.
 
 ## Installation and environments
 
-Install the alpha release from PyPI:
+Install the published alpha from PyPI (it does not include this branch's new APIs):
 
 ```bash
 python -m pip install risex-python-sdk==0.1.0a2
@@ -110,13 +111,32 @@ rounding. Floats are rejected at numerical protocol boundaries.
 
 ## Accounts and signing
 
-Account reads require an account address, but no signer. Use
+Balance, position and order reads require an account address, but no signer. Use
 `get_balances()`, `get_position(market_id)`, `get_positions()`,
 `get_open_orders()`, `get_order(order_id)`, `get_order_history()` and
 `get_trade_history()`. Paginated `iter_positions()`, `iter_open_orders()`,
 `iter_order_history()` and `iter_trade_history()` have explicit page bounds.
 `get_account_snapshot()` collects fresh REST balances, positions and open orders;
 the constituent requests are separate exchange reads.
+
+`get_tpsl_orders()` and `iter_tpsl_orders()` query conditional orders, including both
+take-profit and stop-loss by default. `get_account_snapshot(include_conditional_orders=True)`
+adds all active TP/SL orders, including triggered orders that may still be executing.
+`conditional_orders=None` means not queried; `()` means queried and empty.
+
+Account fee tiers require a JWT session. With a configured owner or already-registered
+session-key signer, call `await client.login()`, then `await client.get_user_fees()`.
+The response supplies `tier`, `taker_bps`, `maker_bps` and the schedule/progress.
+Rates are already basis points. See [the testnet example](examples/account_fees.py).
+
+Sessions are held only in memory; public `client.session` metadata contains no tokens.
+Fee reads refresh expiring sessions automatically, with a lock around token rotation.
+Login/refresh/logout POSTs are attempted once. An uncertain or failed refresh discards
+the local session, so callers must log in again instead of replaying a rotating token.
+A fee-read HTTP 401 also invalidates the session and requires explicit login.
+`await client.logout()` revokes this token family; closing the client only clears local
+tokens and does not contact the server. These methods do not approve allowances,
+register keys, place orders or change margin.
 
 For signed operations, pass the account identity and its registered delegated
 signer separately:
@@ -168,7 +188,9 @@ else:
 ```
 
 Choose actual quantities/prices using current market metadata. A market order
-uses `order_type=OrderType.MARKET` and still requires an explicit `price` bound.
+uses `order_type=OrderType.MARKET` with `price=Decimal("0")`, matching the native
+zero-price encoding. For a maximum buy price or minimum sell price, use
+`OrderType.LIMIT` with `TimeInForce.IOC` or `TimeInForce.FOK` instead.
 Default time-in-force is IOC for market orders, GTC for limit orders.
 GTT requires nonzero protocol `ttl_units`; reduce-only, post-only and STP flags
 are validated. The SDK checks market activity, precision and protocol widths

@@ -62,6 +62,48 @@ async def main():
     backend = backend_module.Backend(owner.address, signer.address, market)
 
     async def http_handler(request):
+        if request.url.path in {"/v1/auth/login", "/v1/auth/refresh"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "access_token": "offline-access",
+                        "refresh_token": "offline-refresh",
+                        "expires_in": 900,
+                        "token_type": "Bearer",
+                    }
+                },
+            )
+        if request.url.path == "/v1/auth/logout":
+            return httpx.Response(200, json={"data": {"success": True}})
+        if request.url.path == "/v1/user/fees":
+            assert request.headers["authorization"] == "Bearer offline-access"
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "tier": 1,
+                        "taker_bps": 2,
+                        "maker_bps": 0.5,
+                        "weighted_14d_volume_usd": "0",
+                        "applied_at": "",
+                        "schedule": [],
+                    }
+                },
+            )
+        if request.url.path == "/v1/orders/tpsl":
+            assert request.url.params["stop_type"] == "STOP_TYPE_NONE"
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "orders": [],
+                        "total": "0",
+                        "page": 1,
+                        "limit": 100,
+                    }
+                },
+            )
         if request.url.path == "/v1/orderbook":
             return httpx.Response(200, json=book_reply)
         return await backend(request)
@@ -122,6 +164,13 @@ async def main():
             await client.get_markets()
             await client.get_orderbook(1)
             await client.get_signer_status()
+            await client.login()
+            assert (await client.get_user_fees()).taker_bps == Decimal(2)
+            await client.refresh_session()
+            assert await client.logout()
+            assert (
+                await client.get_account_snapshot(include_conditional_orders=True)
+            ).conditional_orders == ()
             assert (await client.register_signer(owner, expiration=int(time.time()) + 3600)).success
             assert (await client.get_position(1)).position.size == 0
             receipt = await client.place_order(

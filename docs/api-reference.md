@@ -56,6 +56,7 @@ Page numbers start at 1; open-order offsets start at 0.
 | `get_orderbook(market_id, limit=50)` | `OrderbookSnapshot` with `.bids` and `.asks`; limit 1–250 |
 | `get_signing_domain()` | `SigningDomain` |
 | `get_system_config()` | `SystemConfig` |
+| `decode_transaction(tx_hash)` | `DecodedTransaction`: success flag and optional decoded contract error |
 | `initialize(force_refresh=False)` | Validated, cached `ProtocolMetadata` |
 | `get_nonce_state(account=None)` | `NonceState` with anchor, index and bitmap |
 | `get_signer_status(account=None, signer=None)` | `SessionKeyStatus` with `.active` |
@@ -63,6 +64,17 @@ Page numbers start at 1; open-order offsets start at 0.
 `market_ids` is a sequence of unique positive integers. Omitted/empty IDs
 request all markets. `initialize()` performs reads only; signing code invokes
 it when necessary. `force_refresh=True` refreshes its metadata cache.
+
+`decode_transaction()` uses the public [transaction decoder](https://developer.rise.trade/reference/decodetx)
+(`GET /v1/tx/{tx_hash}`); it requires no account or signer and never submits a
+transaction. Hashes must contain `0x` followed by exactly 64 hexadecimal digits.
+If the provider includes a response hash, it must match the requested hash.
+`DecodedTransaction.success` is a required boolean. Its optional `.error` is a
+`DecodedError` retaining `.selector`, `.signature`, `.name`, `.parameters` (a tuple
+of strings) and `.message`. An unsuccessful transaction without decoded details
+remains `success=False, error=None`; the SDK does not invent a cause or replay it.
+Save the original transaction hash when handling an uncertain submission so it
+can be investigated later. Decoding does not replace fresh order/position reads.
 
 ### Accounts and pagination
 
@@ -77,7 +89,42 @@ it when necessary. `force_refresh=True` refreshes its metadata cache.
 | `get_order(order_id, market_id=None)` | One `Order` |
 | `get_order_history(...)` | `OrderHistory`: orders, page, has_next_page |
 | `get_trade_history(...)` | `TradeHistory`: trades (`Fill` models), page, has_next_page |
-| `get_account_snapshot(account=None, max_pages=1000)` | `AccountSnapshot`: balances, positions, open_orders |
+| `get_account_snapshot(account=None, max_pages=1000, include_conditional_orders=False)` | `AccountSnapshot`: balances, positions, open_orders, optional active conditional_orders |
+| `login()` | Token-free `LoginSession` metadata; uses configured owner/registered signer |
+| `refresh_session()` | Updated `LoginSession`; refreshes once and rotates in-memory tokens |
+| `logout()` | `True` after confirmed revocation, `False` if no local session existed |
+| `session` (property) | `LoginSession` or `None`; no raw tokens |
+| `get_user_fees()` | `UserFees`: actual account tier, taker/maker bps, volume, next-tier progress and schedule |
+| `get_tpsl_orders(...)` | `TpslOrdersResponse`: orders, total, page, limit, has_next_page |
+| `iter_tpsl_orders(...)` | Async iterator over `TpslOrder` |
+
+JWT login is explicit. `get_user_fees()` refreshes before expiry, but does not sign a
+new login automatically. Failed/uncertain refresh and HTTP 401 require explicit login.
+Tokens are private and in memory only. Token rotation is serialized; auth POSTs are
+not retried. The fee endpoint has no account override: it always uses the logged-in
+account. Only fee requests carry the bearer token; public reads and permit operations
+do not inherit it. Fee JSON numbers are parsed directly into Decimal, without a float
+round trip. Negative maker rebates are preserved.
+
+```text
+get_tpsl_orders(
+    *, account=None, market_id=None, page=1, limit=100, statuses=(),
+    stop_type="STOP_TYPE_NONE", start_time=None, end_time=None
+)
+iter_tpsl_orders(
+    *, account=None, market_id=None, page_size=100, max_pages=1000, statuses=(),
+    stop_type="STOP_TYPE_NONE", start_time=None, end_time=None
+)
+```
+
+The SDK explicitly sends `STOP_TYPE_NONE` to avoid the API's TAKE_PROFIT default.
+Other stop filters are `TAKE_PROFIT`/`STOP_LOSS`; statuses are the native
+`TPSL_ORDER_STATUS_ACCEPTED`, `TRIGGERED`, `SUCCESS`, `CANCELLED` values (each with
+the `TPSL_ORDER_STATUS_` prefix). `TpslOrder.active` includes accepted and triggered.
+Time filters are nanoseconds. Account/market/status/stop scopes, page sizes and totals
+are checked. Duplicate IDs, changing totals, incomplete pages and page-bound exhaustion
+raise `ProtocolError`; discard partial iterator results and fetch a new snapshot.
+REST pagination cannot promise an atomic view during concurrent order changes.
 
 History arguments:
 
@@ -155,7 +202,7 @@ of administrative mutation.
 | `market_id` | Required positive uint16 integer |
 | `side` | Required `OrderSide.BUY` (0) or `SELL` (1) |
 | `quantity` | Required positive finite `Decimal`, in human units |
-| `price` | Required positive finite `Decimal`; limit price or market execution bound |
+| `price` | Required finite `Decimal`: positive for LIMIT, exactly zero for MARKET |
 | `order_type` | `OrderType.LIMIT` (1); `MARKET` is 0 |
 | `time_in_force` | `None` chooses GTC for limits, IOC for market orders |
 | `post_only` | `False`; supported for resting limit GTC/GTT orders |
@@ -170,6 +217,11 @@ of administrative mutation.
 be post-only. GTT uses native protocol TTL units; do not pass a Unix timestamp
 or assume the field is seconds. Order precision and size/price encoding widths
 are checked against current metadata before a nonce is reserved.
+
+Compatibility correction: native MARKET orders use `price=Decimal("0")`
+(`price_ticks=0`). Previous SDK versions incorrectly required a positive market
+price. Use a positive-price LIMIT order with IOC/FOK when an execution price
+bound is needed. Neither form bypasses the exchange's own matching price bands.
 
 | Model | Fields commonly used by consumers |
 | --- | --- |
@@ -294,3 +346,30 @@ Invalid caller input can also raise `ValueError`, `TypeError` or Pydantic
 `ValidationError`. Reads have bounded retry rules; writes do not retry.
 Cancellation during transmission can raise `UnknownOutcomeError` because the
 mutation may have executed. See [recovery guidance](developer-guide.md#handle-uncertainty).
+
+## Portfolio risk and account controls (local 0.1.0a3.dev0)
+
+- `get_portfolio_details(account=None)` returns exact USD summary values and
+  signed decimal coin quantities, validates account scope and unique market IDs.
+  Cross margin/maintenance totals exclude isolated scopes. Blank settlement
+  fields in portfolio rows remain `None`; they are not silently converted to zero.
+- `update_leverage(market_id, leverage)` validates a positive uint8 value and the
+  current market maximum, then submits one VerifyWitness permit.
+- `update_margin_mode(market_id, isolated=bool)` submits one VerifyWitness permit.
+  A redundant setting can revert `MarginModeUnchanged`; read the current mode first.
+- `cancel_all_tpsl_orders(market_id)` signs `CancelAllTpslOrders` directly and returns
+  a confirmed success/count. It cancels accepted TP/SLs; triggered orders still
+  need reconciliation. This signature does not consume a bitmap nonce, so its
+  `MutationContext` nonce fields are `None`.
+
+Account setting replies require successful chain receipt status and consistent
+block numbers. Timeout, malformed reply or ambiguous server failure is not success
+and is never automatically replayed. The caller must independently reconcile.
+
+Live testnet unit finding (2026-10-07): indexed `Position.size` returned WAD integers
+(e.g. `290000000000000` for 0.00029 BTC), while `AccountPosition.size` and
+`PortfolioPosition.size` returned decimal coin quantities. Wire models retain
+provider values. Do not interchange the routes or infer units from magnitude.
+The portfolio side flag was observed as zero even for a negative short size;
+use signed size and independently compare the direct position read. Consumers
+must verify units/scope before using indexed quantities for orders or displays.

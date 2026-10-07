@@ -133,6 +133,25 @@ def test_cancel_commits_to_resting_id_not_composite_id():
     )
 
 
+@pytest.mark.parametrize("time_in_force", [2, 3])
+def test_native_market_order_packing_uses_zero_price(time_in_force):
+    args = dict(
+        market_id=1,
+        size_steps=29,
+        price_ticks=0,
+        side=1,
+        post_only=False,
+        reduce_only=True,
+        stp_mode=0,
+        order_type=0,
+        time_in_force=time_in_force,
+    )
+    flags = 1 | (1 << 2) | (time_in_force << 6)
+    assert pack_order(**args) == (1 << 70) | (29 << 38) | (flags << 6) | 2
+    with pytest.raises(ValueError, match="zero price_ticks"):
+        pack_order(**{**args, "price_ticks": 600000})
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

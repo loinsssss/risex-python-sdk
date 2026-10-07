@@ -30,6 +30,34 @@ async def sign(signer: Signer, data: dict[str, Any]) -> bytes:
     return signature
 
 
+async def login_payload(
+    metadata: ProtocolMetadata, *, account: str, signer: Signer, nonce: str, deadline: int
+) -> dict[str, Any]:
+    """Sign the nonce as uint256; retain its original hex encoding on the wire."""
+    normalized = nonce.removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", normalized):
+        raise AuthenticationError("Login nonce must be a 32-byte hex string")
+    uint(deadline, 32, "deadline")
+    selected = address(account)
+    signature = await sign(
+        signer,
+        typed_data(
+            metadata.domain.signing_values(),
+            "Login",
+            {"account": selected, "nonce": int(normalized, 16), "deadline": deadline},
+        ),
+    )
+    payload = {
+        "account": selected,
+        "nonce": nonce,
+        "deadline": deadline,
+        "signature": signature_hex(signature),
+    }
+    if address(signer.address) != selected:
+        payload["signer"] = address(signer.address)
+    return payload
+
+
 async def permit(
     metadata: ProtocolMetadata,
     *,

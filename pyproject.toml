@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "risex-python-sdk"
-version = "0.1.0a2"
+version = "0.1.0a3.dev0"
 description = "Independent asynchronous Python client for RISEx REST and WebSocket APIs"
 readme = "README.md"
 license = "MIT"
@@ -49,6 +49,7 @@ packages = ["src/risex"]
 include = [
     "/src", "/tests",
     "/examples/account_reads.py", "/examples/order_lifecycle.py",
+    "/examples/account_fees.py",
     "/examples/private_stream.py", "/examples/public_rest.py",
     "/examples/public_stream.py", "/examples/register_signer.py",
     "/docs/api-contracts.md", "/docs/api-reference.md",

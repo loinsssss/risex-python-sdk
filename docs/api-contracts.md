@@ -47,8 +47,37 @@ Deployed responses commonly wrap generated schemas as
 | Cancellation | `POST /v1/orders/cancel` | Composite ID, market, permit, `no_retry: true` |
 | Cancel all in market | `POST /v1/orders/cancel-all` | Market, permit |
 
-Documented account read endpoints do not require a signature. Returned account,
+The balance/position/order read endpoints do not require a signature. Returned account,
 market, order and page scopes are checked where present.
+
+### JWT sessions and fee tiers (development branch)
+
+Verified against the current [OpenAPI schema](https://api.testnet.rise.trade/swagger/api.swagger.json),
+[login reference](https://developer.rise.trade/reference/authservice_login),
+[fee reference](https://developer.rise.trade/reference/feetierservice_getuserfees) and
+[TP/SL reference](https://developer.rise.trade/reference/orderservice_gettpslorders).
+
+- `GET /v1/auth/nonce` returns a one-use 32-byte hex nonce. Login signs
+  `Login(address account,uint256 nonce,uint32 deadline)` with the native EIP-712
+  domain. The nonce is signed as an integer but submitted in its original hex form.
+  Signature wire encoding is 65-byte hex, not the compact base64 permit format.
+- `POST /v1/auth/login` includes `signer` only for a delegated session key. The SDK
+  checks that delegated keys are Active, and validates its signatures by recovery.
+- `POST /v1/auth/refresh` rotates the refresh token. Replaying a consumed token can
+  revoke the family. The SDK retires tokens before sending and never retries auth
+  POSTs, including after cancellation or an unusable response.
+- `GET /v1/user/fees` requires the returned bearer token. `expires_in` governs
+  refresh timing; no token lifetime is hardcoded. Bps/progress are JSON numbers in
+  this schema, so this endpoint parses their lexical values into Decimal.
+- `POST /v1/auth/logout` sends the access token and refresh token to revoke the family.
+  The SDK clears local tokens even when revocation cannot be confirmed.
+- `GET /v1/orders/tpsl` uses repeated `statuses`, page/limit and an explicit
+  `stop_type=STOP_TYPE_NONE` to include both TP and SL. Active snapshots include
+  ACCEPTED and TRIGGERED. Response `total` determines pagination; missing pages,
+  duplicates or changed totals are errors, not empty account state.
+
+The new methods do not implement JWT trading, allowance approval, TP/SL placement
+or cancellation. Account snapshots remain non-atomic reads.
 
 ## Numbers and lifecycle
 

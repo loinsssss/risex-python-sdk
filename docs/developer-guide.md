@@ -107,7 +107,7 @@ are retained as strings.
 
 ## 4. Read an account and traverse pages
 
-Account reads require an address, but no private key. Set `RISEX_ACCOUNT` to your
+Balance/position/order reads require an address, but no private key. Set `RISEX_ACCOUNT` to your
 account's 0x-prefixed Ethereum address, then run:
 
 ```bash
@@ -234,8 +234,9 @@ then `await client.wait_for_order(receipt.order_id)` to observe terminal state.
 `cancel_all_orders(market_id)` cancels orders in that market.
 Polling timeout does not itself send a cancellation.
 
-For market orders, set `order_type=OrderType.MARKET`. `price` remains required:
-it is the maximum acceptable buy price or minimum acceptable sell price.
+For market orders, set `order_type=OrderType.MARKET` and `price=Decimal("0")`.
+For a maximum acceptable buy price or minimum acceptable sell price, use
+`OrderType.LIMIT` with `TimeInForce.IOC` or `TimeInForce.FOK`.
 Default TIF is IOC for market orders, GTC for limits. `reduce_only=True` constrains
 execution to a reduction. See the reference for other execution flags and bounds.
 

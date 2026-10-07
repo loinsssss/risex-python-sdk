@@ -1,5 +1,12 @@
 # Funded testnet handoff
 
+Development-branch validation on 2026-10-07 (Python 3.12): 167 offline tests,
+strict mypy, Ruff, source/wheel builds and the isolated wheel consumer passed.
+The separate session integration gate passed on testnet: delegated-key login,
+fee reads, one refresh, active TP/SL enumeration and logout. The observed account
+had no active conditional orders; nonempty TP/SL parsing/pagination and failure
+cases are covered offline, not claimed as live funded-order validation.
+
 The implementation is ready for wallet-based validation. Public testnet REST
 and streams already pass. Offline servers verify signing and lifecycle contracts;
 live active signer status, account reads and authenticated order/position
@@ -58,6 +65,21 @@ python examples/private_stream.py --testnet
 No fill snapshot is promised; a live fill requires actual execution. Verify fresh
 authentication after reconnect with a still-active signer, then verify expired
 or revoked signers fail clearly.
+
+## Session and fee read gate
+
+For this branch's fee/session reads, a separate gate exercises login, a fee read,
+one explicit refresh, another fee read, active conditional orders and logout:
+
+```bash
+RISEX_RUN_SESSION_INTEGRATION=1 \
+python -m pytest tests/integration/test_session_testnet.py -v
+```
+
+It uses `RISEX_TEST_ACCOUNT` and `RISEX_TEST_SIGNER_PRIVATE_KEY`. It never submits
+orders, registers keys or grants allowances. The bot integration independently
+performs login/fee/TP-SL reads/logout, recording only financial fields and token-free
+metadata. Do not load a file's funded-trading enable flags when running read tests.
 
 ## Funded placement/cancellation gate
 

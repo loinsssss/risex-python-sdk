@@ -295,19 +295,83 @@ async def test_overflow_is_rejected_before_reserving_a_nonce(
     assert not backend.posts
 
 
-async def test_market_order_explicit_price_bound_and_ioc(config, backend, signer):
+@pytest.mark.parametrize("time_in_force", [None, TimeInForce.FOK, TimeInForce.IOC])
+async def test_market_order_zero_price_signed_payload(config, backend, signer, time_in_force):
     request = OrderRequest(
         market_id=1,
         side=OrderSide.SELL,
         quantity=Decimal("0.001"),
-        price=Decimal("60000"),
+        price=Decimal("0"),
         order_type=OrderType.MARKET,
+        time_in_force=time_in_force,
+        reduce_only=True,
+        client_order_id=99,
     )
     async with client_for(config, backend, signer) as client:
         await client.place_order(request)
     body = backend.posts[0][1]
-    assert body["order_type"] == 0 and body["time_in_force"] == 3
-    assert body["price_ticks"] == 600000
+    tif = int(time_in_force if time_in_force is not None else TimeInForce.IOC)
+    assert body["order_type"] == 0 and body["time_in_force"] == tif
+    assert body["price_ticks"] == 0
+    assert body["size_steps"] == 1000
+    assert body["reduce_only"] is True
+    # Independently reconstruct the native zero-price order and recover its signer.
+    flags = 1 | (1 << 2) | (tif << 6)
+    packed = (1 << 70) | (1000 << 38) | (flags << 6) | 2
+
+    def word(value):
+        return int(value).to_bytes(32, "big")
+
+    action_hash = keccak(
+        keccak(text="RISE_PERPS_PLACE_ORDER_V1")
+        + word(5)
+        + word(packed)
+        + word(0)
+        + word(99)
+        + word(0)
+    )
+    signed = typed_data(
+        {
+            "name": "RISEx",
+            "version": "1",
+            "chainId": 4153,
+            "verifyingContract": backend.domain["verifying_contract"],
+        },
+        "VerifyWitness",
+        {
+            "account": backend.account,
+            "target": backend.system["addresses"]["router"],
+            "hash": action_hash,
+            "nonceAnchor": int(body["permit"]["nonce_anchor"]),
+            "nonceBitmap": body["permit"]["nonce_bitmap_index"],
+            "deadline": body["permit"]["deadline"],
+        },
+    )
+    assert (
+        Account.recover_message(
+            encode_typed_data(full_message=signed),
+            signature=standard_signature(body["permit"]["signature"]),
+        )
+        == signer.address
+    )
+
+
+@pytest.mark.parametrize(
+    ("order_type", "price", "message"),
+    [
+        (OrderType.LIMIT, Decimal("0"), "limit orders require a positive price"),
+        (OrderType.MARKET, Decimal("60000"), "market orders require price=0"),
+    ],
+)
+def test_order_type_price_semantics_rejected(order_type, price, message):
+    with pytest.raises(ValidationError, match=message):
+        OrderRequest(
+            market_id=1,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.001"),
+            price=price,
+            order_type=order_type,
+        )
 
 
 @pytest.mark.parametrize(
@@ -316,8 +380,8 @@ async def test_market_order_explicit_price_bound_and_ioc(config, backend, signer
         {"quantity": 0.1},
         {"price": 60000.0},
         {"side": True},
-        {"order_type": OrderType.MARKET, "time_in_force": TimeInForce.GTC},
-        {"order_type": OrderType.MARKET, "post_only": True},
+        {"order_type": OrderType.MARKET, "price": Decimal("0"), "time_in_force": TimeInForce.GTC},
+        {"order_type": OrderType.MARKET, "price": Decimal("0"), "post_only": True},
         {"time_in_force": TimeInForce.GTT},
         {"builder_fee_bps": 10},
     ],

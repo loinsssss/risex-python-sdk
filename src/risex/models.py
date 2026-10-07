@@ -37,7 +37,12 @@ class WireModel(BaseModel):
             raise ValueError("RISEx numeric fields must use exact strings or integers")
         if isinstance(value, bool) and info.field_name is not None:
             annotation = cls.model_fields[info.field_name].annotation
-            if annotation is not bool and bool not in get_args(annotation):
+            args = get_args(annotation)
+            if (
+                annotation is not bool
+                and bool not in args
+                and not any(type(arg) is bool for arg in args)
+            ):
                 raise ValueError("Booleans cannot represent RISEx numeric or string fields")
         return value
 
@@ -266,6 +271,95 @@ class Balances(BaseModel):
     cross_margin: Balance
 
 
+class LoginSession(BaseModel):
+    """Public session metadata. Access/refresh tokens are never returned here."""
+
+    model_config = ConfigDict(frozen=True)
+    account: EthereumAddress
+    expires_in: Annotated[int, Field(gt=0, strict=True)]
+    token_type: Literal["Bearer"]
+
+
+class FeeScheduleEntry(WireModel):
+    tier: Annotated[int, Field(ge=0)]
+    threshold_usd: NonnegativeDecimal
+    taker_bps: Annotated[Decimal, Field(ge=0, lt=10000, allow_inf_nan=False)]
+    maker_bps: Annotated[Decimal, Field(gt=-10000, lt=10000, allow_inf_nan=False)]
+
+
+class NextTierProgress(FeeScheduleEntry):
+    remaining_usd: NonnegativeDecimal
+    progress_pct: Annotated[Decimal, Field(ge=0, le=100, allow_inf_nan=False)]
+
+
+class UserFees(WireModel):
+    tier: Annotated[int, Field(ge=0)]
+    taker_bps: Annotated[Decimal, Field(ge=0, lt=10000, allow_inf_nan=False)]
+    maker_bps: Annotated[Decimal, Field(gt=-10000, lt=10000, allow_inf_nan=False)]
+    weighted_14d_volume_usd: NonnegativeDecimal
+    applied_at: str
+    next_tier: NextTierProgress | None = None
+    schedule: tuple[FeeScheduleEntry, ...]
+    trial_tier: Annotated[int, Field(ge=0)] | None = None
+    trial_ends_at: str = ""
+    earned_tier: Annotated[int, Field(ge=0)] | None = None
+
+
+TpslStatus = Literal[
+    "TPSL_ORDER_STATUS_ACCEPTED",
+    "TPSL_ORDER_STATUS_TRIGGERED",
+    "TPSL_ORDER_STATUS_SUCCESS",
+    "TPSL_ORDER_STATUS_CANCELLED",
+]
+StopType = Literal["TAKE_PROFIT", "STOP_LOSS", "STOP_TYPE_NONE"]
+
+
+class TpslOrder(WireModel):
+    order_id: Annotated[str, Field(min_length=1)]
+    account: EthereumAddress
+    market_id: MarketID
+    side: Literal["BUY", "SELL"]
+    size: NonnegativeDecimal
+    stop_type: Literal["TAKE_PROFIT", "STOP_LOSS"]
+    order_type: Literal["MARKET", "LIMIT"]
+    stop_price: PositiveDecimal
+    limit_price: NonnegativeDecimal
+    stop_price_option: Literal["LAST_TRADED_PRICE", "MARK_PRICE", "PRICE_OPTION_NONE"]
+    status: TpslStatus
+    tif: Literal["GTC", "GTT", "FOK", "IOC"]
+    created_at: Annotated[int, Field(ge=0)]
+    expires_at: Annotated[int, Field(ge=0)]
+    triggered_at: Annotated[int, Field(ge=0)]
+    triggered_price: NonnegativeDecimal | None = None
+    trigger_tx_hash: str = ""
+    triggered_tx_hash: str = ""
+    triggered_order_id: str = ""
+    cancel_reason: str = ""
+    size_percent_bps: Annotated[int, Field(ge=0, le=10000)] = 0
+    filled_size: NonnegativeDecimal | None = None
+
+    @field_validator("triggered_price", "filled_size", mode="before")
+    @classmethod
+    def empty_number(cls, value: object) -> object:
+        return None if value == "" else value
+
+    @property
+    def active(self) -> bool:
+        # Triggered can still be executing: it is not terminal.
+        return self.status in {"TPSL_ORDER_STATUS_ACCEPTED", "TPSL_ORDER_STATUS_TRIGGERED"}
+
+
+class TpslOrdersResponse(WireModel):
+    orders: tuple[TpslOrder, ...]
+    total: Annotated[int, Field(ge=0)]
+    page: Annotated[int, Field(ge=1)]
+    limit: Annotated[int, Field(ge=1, le=1000)]
+
+    @property
+    def has_next_page(self) -> bool:
+        return self.page * self.limit < self.total
+
+
 class AccountPosition(WireModel):
     size: FiniteDecimal
     quote_amount: FiniteDecimal
@@ -287,6 +381,7 @@ class AccountPosition(WireModel):
     quote_balance: FiniteDecimal | None = None
     free_isolated_usdc_balance: FiniteDecimal | None = None
     adl_price: NonnegativeDecimal | None = None
+    in_isolated_liquidation: bool | None = None
 
     @field_validator(
         "avg_entry_price",
@@ -310,6 +405,96 @@ class AccountPosition(WireModel):
 
 class PositionResponse(WireModel):
     position: AccountPosition
+
+
+class PortfolioSummary(WireModel):
+    """Provider USD amounts; cross maintenance excludes isolated positions."""
+
+    collateral_margin_balance: FiniteDecimal
+    cross_margin_balance: FiniteDecimal
+    free_collateral: FiniteDecimal
+    total_account_value: FiniteDecimal
+    total_notional: NonnegativeDecimal
+    total_initial_margin: NonnegativeDecimal
+    total_maintenance_margin: NonnegativeDecimal
+    in_liquidation: Annotated[bool, Field(strict=True)]
+    risk_level: Literal["NORMAL", "LIQUIDATION", "ADL"]
+    usdc_balance: FiniteDecimal | None = None
+    total_unrealized_pnl: FiniteDecimal | None = None
+    margin_health: NonnegativeDecimal | None = None
+    total_isolated_order_reserve: NonnegativeDecimal | None = None
+
+
+class PortfolioPosition(WireModel):
+    # This route omits settlement fields that the direct chain route supplies.
+    market_id: MarketID
+    size: FiniteDecimal
+    side: Literal[0, 1]
+    margin_mode: Literal[0, 1]
+    isolated_usdc_balance: NonnegativeDecimal
+    mark_price: PositiveDecimal
+    avg_entry_price: NonnegativeDecimal
+    leverage: NonnegativeDecimal
+    unrealized_pnl: FiniteDecimal
+    initial_margin_requirement: NonnegativeDecimal
+    maintenance_margin_requirement: NonnegativeDecimal
+    in_isolated_liquidation: Annotated[bool, Field(strict=True)]
+    quote_amount: FiniteDecimal | None = None
+    last_funding_payment: FiniteDecimal | None = None
+
+    @field_validator("quote_amount", "last_funding_payment", mode="before")
+    @classmethod
+    def empty_settlement_number(cls, value: object) -> object:
+        return None if value == "" else value
+
+
+class PortfolioDetails(WireModel):
+    account: EthereumAddress
+    summary: PortfolioSummary
+    positions: tuple[PortfolioPosition, ...]
+
+
+class TransactionReceipt(WireModel):
+    status: Literal[1]
+    block_number: Annotated[int, Field(ge=0)]
+    gas_used: Annotated[int, Field(ge=0)]
+
+
+class DecodedError(WireModel):
+    selector: str = ""
+    signature: str = ""
+    name: str = ""
+    parameters: tuple[str, ...] = ()
+    message: str = ""
+
+
+class DecodedTransaction(WireModel):
+    tx_hash: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{64}$")] | None = None
+    success: Annotated[bool, Field(strict=True)]
+    error: DecodedError | None = None
+
+    @model_validator(mode="after")
+    def consistent_outcome(self) -> DecodedTransaction:
+        if self.success and self.error is not None:
+            raise ValueError("Successful transaction cannot contain a decoded revert error")
+        return self
+
+
+class AccountUpdate(WireModel):
+    transaction_hash: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{64}$")]
+    block_number: Annotated[int, Field(ge=0)]
+    receipt: TransactionReceipt
+
+    @model_validator(mode="after")
+    def consistent_block(self) -> AccountUpdate:
+        if self.block_number != self.receipt.block_number:
+            raise ValueError("Transaction and receipt block numbers disagree")
+        return self
+
+
+class TpslCancellation(WireModel):
+    success: Literal[True]
+    cancelled_count: Annotated[int, Field(ge=0)]
 
 
 class Position(WireModel):
@@ -365,8 +550,8 @@ class OrderRequest(BaseModel):
     market_id: Annotated[int, Field(gt=0, lt=2**16, strict=True)]
     side: OrderSide
     quantity: PositiveDecimal
-    # For market orders this is the worst acceptable execution price.
-    price: PositiveDecimal
+    # Native market orders encode a zero price; use LIMIT IOC/FOK for a price bound.
+    price: NonnegativeDecimal
     order_type: OrderType = OrderType.LIMIT
     time_in_force: TimeInForce | None = None
     post_only: Annotated[bool, Field(strict=True)] = False
@@ -401,10 +586,17 @@ class OrderRequest(BaseModel):
     def validate_execution(self) -> OrderRequest:
         tif = self.effective_time_in_force
         if self.order_type == OrderType.MARKET:
+            if self.price != 0:
+                raise ValueError(
+                    "market orders require price=0; use LIMIT IOC/FOK for a price bound"
+                )
             if tif not in (TimeInForce.FOK, TimeInForce.IOC) or self.post_only:
                 raise ValueError("market orders require FOK/IOC and cannot be post_only")
-        elif self.post_only and tif in (TimeInForce.FOK, TimeInForce.IOC):
-            raise ValueError("post_only requires a resting GTC/GTT order")
+        else:
+            if self.price <= 0:
+                raise ValueError("limit orders require a positive price")
+            if self.post_only and tif in (TimeInForce.FOK, TimeInForce.IOC):
+                raise ValueError("post_only requires a resting GTC/GTT order")
         if (tif == TimeInForce.GTT) != bool(self.ttl_units):
             raise ValueError("ttl_units must be nonzero exactly when time_in_force is GTT")
         if self.builder_fee_bps and not self.builder_id:
@@ -593,6 +785,8 @@ class AccountSnapshot(BaseModel):
     balances: Balances
     positions: tuple[Position, ...]
     open_orders: tuple[OpenOrder, ...]
+    # None means not queried; an empty tuple means queried and no active TP/SLs.
+    conditional_orders: tuple[TpslOrder, ...] | None = None
 
 
 class SubmissionResolution(BaseModel):

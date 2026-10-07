@@ -21,6 +21,16 @@ DOMAIN_FIELDS = [
 ]
 
 STRUCTS = {
+    "CancelAllTpslOrders": [
+        {"name": "account", "type": "address"},
+        {"name": "marketId", "type": "uint64"},
+        {"name": "deadline", "type": "uint32"},
+    ],
+    "Login": [
+        {"name": "account", "type": "address"},
+        {"name": "nonce", "type": "uint256"},
+        {"name": "deadline", "type": "uint32"},
+    ],
     "VerifyWitness": [
         {"name": "account", "type": "address"},
         {"name": "target", "type": "address"},
@@ -163,10 +173,19 @@ def pack_order(
     uint(stp_mode, 2, "stp_mode")
     uint(order_type, 1, "order_type")
     uint(time_in_force, 2, "time_in_force")
-    if market_id == 0 or size_steps == 0 or price_ticks == 0 or stp_mode == 3:
-        raise ValueError("Order requires positive market, size and price, and a supported STP mode")
+    if market_id == 0 or size_steps == 0 or stp_mode == 3:
+        raise ValueError("Order requires positive market and size, and a supported STP mode")
     if type(post_only) is not bool or type(reduce_only) is not bool:
         raise TypeError("Order flags must be bool")
+    if order_type == 0:
+        if price_ticks != 0:
+            raise ValueError(
+                "Market orders require zero price_ticks; use LIMIT IOC/FOK for a bound"
+            )
+        if time_in_force not in (2, 3) or post_only:
+            raise ValueError("Market orders require FOK/IOC and cannot be post_only")
+    elif price_ticks == 0:
+        raise ValueError("Limit orders require positive price_ticks")
     flags = (
         side
         | (int(post_only) << 1)
@@ -233,4 +252,21 @@ def cancel_all_action_hash(market_id: int) -> bytes:
                 [keccak(text="RISE_PERPS_CANCEL_ALL_ORDERS_V1"), market_id],
             )
         )
+    )
+
+
+def account_setting_action_hash(market_id: int, value: int, *, setting: str) -> bytes:
+    """Exact account-setting ABI; only the two documented uint8 settings."""
+    uint(market_id, 16, "market_id")
+    uint(value, 8, "value")
+    if market_id == 0:
+        raise ValueError("market_id must be positive")
+    if setting == "leverage" and value > 0:
+        selector = "RISE_PERPS_UPDATE_LEVERAGE_V1"
+    elif setting == "margin_mode" and value in (0, 1):
+        selector = "RISE_PERPS_UPDATE_MARGIN_MODE_V1"
+    else:
+        raise ValueError("Unsupported account setting or value")
+    return bytes(
+        keccak(encode(["bytes32", "uint16", "uint8"], [keccak(text=selector), market_id, value]))
     )

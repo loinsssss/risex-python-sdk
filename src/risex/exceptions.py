@@ -76,8 +76,9 @@ class MutationContext:
 
     operation: str
     account: str
-    nonce_anchor: int
-    nonce_bitmap_index: int
+    # None for direct signatures (e.g. TP/SL cancellation) that do not use bitmap nonces.
+    nonce_anchor: int | None
+    nonce_bitmap_index: int | None
     market_id: int | None = None
     client_order_id: int | None = None
     order_id: str | None = None
