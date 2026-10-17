@@ -542,6 +542,53 @@ class TradeHistory(WireModel):
     wallet_address: EthereumAddress
 
 
+class FundingRateRecord(WireModel):
+    """One settled funding period. Rates are per period (the market's funding interval)."""
+
+    funding_rate: FiniteDecimal
+    accumulated_funding: FiniteDecimal
+    index_price: NonnegativeDecimal
+    start_time: Annotated[int, Field(ge=0)]
+    end_time: Annotated[int, Field(ge=0)]
+    block_number: Annotated[int, Field(ge=0)] | None = None
+    block_time: Annotated[int, Field(ge=0)] | None = None
+    tx_hash: str | None = None
+
+
+class FundingRateHistory(WireModel):
+    """Settlements newest first. Timestamps are Unix nanoseconds."""
+
+    market_id: MarketID
+    records: tuple[FundingRateRecord, ...]
+    page: Annotated[int, Field(ge=1)]
+    has_next_page: bool
+
+
+CandleInterval = Literal["1m", "5m", "15m", "1h", "4h", "1d", "1w"]
+
+
+class Candle(WireModel):
+    """OHLCV bucket starting at ``time`` (Unix nanoseconds), as RISEx reports it.
+
+    RISEx sets ``open`` to the previous candle's ``close``, while ``high``/``low`` cover
+    only trades inside the bucket, so ``open`` can sit outside ``[low, high]``. Buckets
+    without trades are omitted rather than returned empty.
+    """
+
+    market_id: MarketID
+    interval: CandleInterval
+    time: Annotated[int, Field(ge=0)]
+    open: PositiveDecimal
+    high: PositiveDecimal
+    low: PositiveDecimal
+    close: PositiveDecimal
+    volume: NonnegativeDecimal
+
+
+class CandlesResponse(WireModel):
+    data: tuple[Candle, ...]
+
+
 class OrderSubmission(WireModel):
     order_id: str
     tx_hash: str

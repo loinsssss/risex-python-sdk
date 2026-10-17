@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from dataclasses import replace
 
 import pytest
@@ -78,3 +79,33 @@ async def test_runtime_signing_metadata(mainnet):
         assert metadata.domain.chain_id == metadata.system.chain.chain_id
         assert metadata.domain.verifying_contract == metadata.system.addresses.auth
         assert int(metadata.system.addresses.router, 16) != 0
+
+
+@pytest.mark.parametrize("mainnet", [True, False])
+async def test_public_market_history(mainnet):
+    ns = 10**9
+    async with RiseXClient(mainnet=mainnet) as client:
+        now = int(time.time()) * ns
+        funding = [
+            record
+            async for record in client.iter_funding_rate_history(
+                1, page_size=2, max_pages=10, start_time=now - 6 * 3_600 * ns, end_time=now
+            )
+        ]
+        ends = [record.end_time for record in funding]
+        assert ends == sorted(ends, reverse=True)
+        assert all(r.end_time - r.start_time > 0 for r in funding)
+
+        for interval, span in (("1m", 30 * 60), ("1h", 12 * 3_600)):
+            candles = await client.get_candles(
+                1, interval=interval, start_time=now - span * ns, end_time=now
+            )
+            # Idle testnet markets can have no trades, hence no candles, in the window.
+            assert candles or not mainnet, f"no {interval} candles"
+            times = [c.time for c in candles]
+            assert times == sorted(times)
+            for c in candles:
+                assert c.low <= c.close <= c.high
+            # RISEx carries each close forward as the next open.
+            for prev, cur in zip(candles, candles[1:], strict=False):
+                assert cur.open == prev.close
