@@ -28,8 +28,13 @@ from .models import (
     Balance,
     Balances,
     Cancellation,
+    Candle,
+    CandleInterval,
+    CandlesResponse,
     Channel,
     Fill,
+    FundingRateHistory,
+    FundingRateRecord,
     Market,
     MarketsResponse,
     NonceState,
@@ -93,6 +98,17 @@ async def _pair(first: Awaitable[FirstT], second: Awaitable[SecondT]) -> tuple[F
         second_task.cancel()
         await asyncio.gather(first_task, second_task, return_exceptions=True)
         raise
+
+
+_CANDLE_INTERVAL_NS: dict[str, int] = {
+    "1m": 60 * 10**9,
+    "5m": 300 * 10**9,
+    "15m": 900 * 10**9,
+    "1h": 3_600 * 10**9,
+    "4h": 14_400 * 10**9,
+    "1d": 86_400 * 10**9,
+    "1w": 604_800 * 10**9,
+}
 
 
 def _parse(model: type[ModelT], payload: dict[str, Any]) -> ModelT:
@@ -655,6 +671,92 @@ class RiseXClient:
             if not result.has_next_page:
                 return
         raise ProtocolError("Trade history exceeded max_pages; results may be incomplete")
+
+    async def get_funding_rate_history(
+        self,
+        market_id: int,
+        *,
+        page: int = 1,
+        limit: int = 100,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> FundingRateHistory:
+        """Settled funding for one market, newest first. Times are Unix nanoseconds.
+
+        The time range filters on each settlement's ``end_time``; RISEx defaults to the
+        last 7 days when none is given. ``has_next_page`` only means this page was full,
+        so a result set that is an exact multiple of ``limit`` ends with an empty page.
+        """
+        self._ensure_open()
+        validate_market_id(market_id)
+        _page(page, limit)
+        params = [("page", str(page)), ("limit", str(limit))]
+        self._history_filters(params, None, start_time, end_time)
+        payload = await self._rest.get(
+            f"/v1/markets/id/{market_id}/funding-rate-history", params=params
+        )
+        result = _parse(FundingRateHistory, payload)
+        if result.market_id != market_id or result.page != page:
+            raise ProtocolError("Funding history pagination/market scope is inconsistent")
+        return result
+
+    async def iter_funding_rate_history(
+        self,
+        market_id: int,
+        *,
+        page_size: int = 1000,
+        max_pages: int = 1000,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> AsyncIterator[FundingRateRecord]:
+        _max_pages(max_pages)
+        for page in range(1, max_pages + 1):
+            result = await self.get_funding_rate_history(
+                market_id,
+                page=page,
+                limit=page_size,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            for record in result.records:
+                yield record
+            if not result.has_next_page:
+                return
+        raise ProtocolError("Funding history exceeded max_pages; results may be incomplete")
+
+    async def get_candles(
+        self,
+        market_id: int,
+        *,
+        interval: CandleInterval,
+        start_time: int,
+        end_time: int,
+    ) -> tuple[Candle, ...]:
+        """OHLCV candles in [start_time, end_time), oldest first. Times are Unix nanoseconds.
+
+        Only the intervals RISEx serves are accepted: any other duration is silently
+        answered with 1m candles by the API, so it is rejected here instead.
+        """
+        self._ensure_open()
+        validate_market_id(market_id)
+        if interval not in _CANDLE_INTERVAL_NS:
+            raise ValueError(f"interval must be one of {', '.join(_CANDLE_INTERVAL_NS)}")
+        start = uint(start_time, 64, "start_time")
+        end = uint(end_time, 64, "end_time")
+        if end < start:
+            raise ValueError("end_time must not precede start_time")
+        params = [
+            ("interval", str(_CANDLE_INTERVAL_NS[interval])),
+            ("from", str(start)),
+            ("to", str(end)),
+        ]
+        payload = await self._rest.get(
+            f"/v1/markets/id/{market_id}/trading-view-data", params=params
+        )
+        candles = _parse(CandlesResponse, payload).data
+        if any(row.market_id != market_id or row.interval != interval for row in candles):
+            raise ProtocolError("Candles returned another market or interval")
+        return candles
 
     async def _permit(self, action_hash: bytes, nonce: Nonce) -> dict[str, Any]:
         account, signer = self._credentials()

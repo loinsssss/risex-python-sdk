@@ -26,12 +26,16 @@ from .models import (
     Balance,
     Balances,
     Cancellation,
+    Candle,
+    CandleInterval,
     Channel,
     ConnectionEvent,
     ContractAddresses,
     DataEvent,
     Fill,
     FillsEvent,
+    FundingRateHistory,
+    FundingRateRecord,
     Market,
     MarketConfig,
     MarketsResponse,
@@ -87,6 +91,8 @@ __all__ = [
     "Balance",
     "Balances",
     "Cancellation",
+    "Candle",
+    "CandleInterval",
     "Channel",
     "ChecksumMismatchError",
     "ClientClosedError",
@@ -95,6 +101,8 @@ __all__ = [
     "DataEvent",
     "Fill",
     "FillsEvent",
+    "FundingRateHistory",
+    "FundingRateRecord",
     "LocalSigner",
     "LocalOrderbook",
     "Market",
@@ -163,4 +171,4 @@ __all__ = [
     "to_wei",
 ]
 
-__version__ = "0.1.0a2"
+__version__ = "0.1.0a3"

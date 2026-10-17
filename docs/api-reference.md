@@ -64,6 +64,32 @@ Page numbers start at 1; open-order offsets start at 0.
 request all markets. `initialize()` performs reads only; signing code invokes
 it when necessary. `force_refresh=True` refreshes its metadata cache.
 
+### Market history
+
+| Method / arguments | Returns |
+| --- | --- |
+| `get_funding_rate_history(market_id, page=1, limit=100, start_time=None, end_time=None)` | `FundingRateHistory`: market_id, records (`FundingRateRecord`), page, has_next_page |
+| `get_candles(market_id, interval=..., start_time=..., end_time=...)` | Tuple of `Candle`, oldest first |
+
+```text
+iter_funding_rate_history(
+    market_id, *, page_size=1000, max_pages=1000, start_time=None, end_time=None
+)
+    -> AsyncIterator[FundingRateRecord]
+```
+
+Times are integer nanoseconds. Funding settlements come newest first and the
+range filters on each settlement's `end_time`; with no range RISEx returns the
+last 7 days. `has_next_page` only reports a full page, so a result that is an
+exact multiple of the page size ends with one empty page. `funding_rate` is the
+rate for one funding period (the market's `funding_interval`, hourly today).
+
+`interval` must be one of `1m`, `5m`, `15m`, `1h`, `4h`, `1d`, `1w`. RISEx
+answers any other duration with 1m candles, so the SDK rejects it, and raises
+`ProtocolError` if a response carries a different interval. Candles are
+returned as reported: `open` is the previous candle's `close`, so it can lie
+outside `[low, high]`, and buckets without trades are omitted.
+
 ### Accounts and pagination
 
 | Method / arguments | Returns |
