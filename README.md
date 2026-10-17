@@ -28,7 +28,7 @@ delegated signer registration/revocation; EIP-712 order permits; limit/market
 orders, cancellation and outcome reconciliation; public and private streams;
 and a checksummed local orderbook.
 
-This is an alpha release (`0.1.0a2`). Offline lifecycle tests and live public
+This is an alpha release (`0.1.0a3`). Offline lifecycle tests and live public
 checks pass, as do live testnet account reads and authenticated order/position
 snapshots. Funded transactions, live fills and private reconnect/expiry scenarios
 remain to be validated, with explicit test gates provided.
@@ -38,7 +38,7 @@ remain to be validated, with explicit test gates provided.
 Install the alpha release from PyPI:
 
 ```bash
-python -m pip install risex-python-sdk==0.1.0a2
+python -m pip install risex-python-sdk==0.1.0a3
 ```
 
 For local development:

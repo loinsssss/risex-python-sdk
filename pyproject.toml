@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "risex-python-sdk"
-version = "0.1.0a2"
+version = "0.1.0a3"
 description = "Independent asynchronous Python client for RISEx REST and WebSocket APIs"
 readme = "README.md"
 license = "MIT"

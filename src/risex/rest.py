@@ -81,7 +81,7 @@ class RestClient:
             base_url=config.base_url.rstrip("/") + "/",
             timeout=config.request_timeout,
             transport=transport,
-            headers={"Accept": "application/json", "User-Agent": "risex-python-sdk/0.1.0a2"},
+            headers={"Accept": "application/json", "User-Agent": "risex-python-sdk/0.1.0a3"},
         )
 
     async def aclose(self) -> None:
